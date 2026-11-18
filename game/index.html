@@ -565,6 +565,9 @@ function buildShotScene() {
     state = 'over'; overTimer = 2; overReason = 'The Bastion core went dark.';
     wave = 9; score = 21830; kills = 143; level = 7; core.hp = 0;
   }
+  if (shotMode === 'upgrade') {
+    level = 6; offerCards(); state = 'levelup';
+  }
 }
 
 /* ---------- main loop ---------- */
