@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AEGIS — Neon Bastion</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060f; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; box-shadow: 0 0 80px rgba(64, 224, 255, .15); }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script>
+'use strict';
+/* AEGIS — Neon Bastion. An arena-defense roguelite in one file: pilot the last Aegis fighter,
+   hold the line around the Bastion core, harvest flux from the wrecks, and choose how you grow
+   stronger between waves. Survive the swarm. */
+const W = 1280, H = 720;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+/* ---------- deterministic RNG (seeded for screenshot scenes) ---------- */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const params = new URLSearchParams(location.search);
+const shotMode = params.get('shot');
+const seedBase = Number(params.get('seed') || 1);
+let rand = shotMode ? mulberry32(seedBase * 7919 + 13) : Math.random;
+const rr = (a, b) => a + rand() * (b - a);
+const TAU = Math.PI * 2;
+
+/* ---------- audio: tiny WebAudio synth, no assets ---------- */
+let audioCtx = null, muted = false;
+function beep(freq, dur, type, vol, slide) {
+  if (muted || shotMode) return;
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const t = audioCtx.currentTime;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol || 0.05, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t); o.stop(t + dur);
+  } catch (e) { /* audio is decoration */ }
+}
+const sfx = {
+  shoot: () => beep(rr(680, 760), 0.07, 'square', 0.018, -320),
+  boom: () => { beep(rr(120, 170), 0.25, 'sawtooth', 0.05, -90); beep(60, 0.3, 'triangle', 0.06, -30); },
+  hurt: () => beep(220, 0.18, 'sawtooth', 0.06, -140),
+  pickup: () => beep(rr(880, 990), 0.09, 'sine', 0.035, 240),
+  level: () => { beep(523, 0.12, 'sine', 0.05); setTimeout(() => beep(784, 0.16, 'sine', 0.05), 90); },
+  wave: () => beep(196, 0.3, 'triangle', 0.05, 98),
+};
+
+/* ---------- input ---------- */
+const keys = {};
+let mouseX = W / 2, mouseY = H / 3, mouseDown = false;
+addEventListener('keydown', (e) => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === ' ') e.preventDefault();
+  if (state === 'title' && (e.key === 'Enter' || e.key === ' ')) startGame();
+  else if (state === 'over' && (e.key === 'Enter' || e.key === ' ')) startGame();
+  else if (state === 'play' && (e.key.toLowerCase() === 'p')) state = 'pause';
+  else if (state === 'pause' && (e.key.toLowerCase() === 'p' || e.key === 'Enter')) state = 'play';
+  if (e.key.toLowerCase() === 'm') muted = !muted;
+});
+addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+function canvasPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height)];
+}
+canvas.addEventListener('mousemove', (e) => { const [x, y] = canvasPos(e); mouseX = x; mouseY = y; });
+canvas.addEventListener('mousedown', (e) => {
+  const [x, y] = canvasPos(e); mouseX = x; mouseY = y; mouseDown = true;
+  if (state === 'title') startGame();
+  else if (state === 'over' && overTimer > 0.6) startGame();
+  else if (state === 'levelup') pickCard(x, y);
+});
+addEventListener('mouseup', () => { mouseDown = false; });
+
+/* ---------- game state ---------- */
+let state = 'title'; // title | play | levelup | pause | over
+let time = 0, shake = 0, overTimer = 0;
+let player, core, enemies, bullets, ebullets, shards, parts, texts, stars;
+let wave, score, kills, flux, level, xpNext, spawnQueue, spawnTimer, waveState, bossRef;
+
+function makeStars() {
+  const out = [];
+  for (let i = 0; i < 170; i++) out.push({ x: rr(0, W), y: rr(0, H), z: rr(0.25, 1), tw: rr(0, TAU) });
+  return out;
+}
+function reset() {
+  player = {
+    x: W / 2, y: H / 2 + 130, r: 13, hp: 100, hpMax: 100, speed: 265,
+    damage: 12, fireRate: 5.2, shots: 1, bulletSpeed: 640, pierce: 0,
+    magnet: 92, shieldT: 0, cooldown: 0, nova: 0, regen: 0, angle: -Math.PI / 2,
+  };
+  core = { x: W / 2, y: H / 2, r: 30, hp: 240, hpMax: 240, pulse: 0 };
+  enemies = []; bullets = []; ebullets = []; shards = []; parts = []; texts = [];
+  stars = makeStars();
+  wave = 0; score = 0; kills = 0; flux = 0; level = 1; xpNext = 6;
+  spawnQueue = []; spawnTimer = 0; waveState = 'announce'; bossRef = null;
+  nextWave();
+}
+function startGame() { rand = Math.random; reset(); state = 'play'; sfx.wave(); }
+
+/* ---------- waves ---------- */
+function nextWave() {
+  wave++;
+  waveState = 'announce';
+  spawnTimer = 2.2;
+  spawnQueue = [];
+  const n = 6 + wave * 3;
+  for (let i = 0; i < n; i++) spawnQueue.push(wave >= 3 && rand() < 0.16 ? 'dart' : 'chaser');
+  if (wave >= 4) for (let i = 0; i < Math.floor(wave / 2); i++) spawnQueue.push('tank');
+  if (wave % 5 === 0) spawnQueue.push('boss');
+  banner = 'WAVE ' + wave + (wave % 5 === 0 ? ' — WARDEN INBOUND' : '');
+  bannerT = 2.2;
+  sfx.wave();
+}
+let banner = '', bannerT = 0;
+
+function spawnEnemy(kind) {
+  const side = Math.floor(rr(0, 4));
+  let x, y;
+  if (side === 0) { x = rr(0, W); y = -30; } else if (side === 1) { x = W + 30; y = rr(0, H); }
+  else if (side === 2) { x = rr(0, W); y = H + 30; } else { x = -30; y = rr(0, H); }
+  const base = {
+    chaser: { hp: 22, speed: 62, r: 13, dmg: 10, xp: 1, score: 50, color: '#ff5470' },
+    dart: { hp: 12, speed: 138, r: 9, dmg: 7, xp: 1, score: 80, color: '#ffb84d' },
+    tank: { hp: 130, speed: 34, r: 26, dmg: 22, xp: 4, score: 200, color: '#c65dff' },
+    boss: { hp: 1500, speed: 22, r: 52, dmg: 34, xp: 30, score: 2500, color: '#ff3860' },
+  }[kind];
+  const scale = 1 + (wave - 1) * 0.13;
+  const e = {
+    kind, x, y, r: base.r, hp: base.hp * scale, hpMax: base.hp * scale,
+    speed: base.speed * rr(0.85, 1.15), dmg: base.dmg, xp: base.xp, scoreV: base.score,
+    color: base.color, hitT: 0, fireT: rr(1, 2.4), spin: rr(0, TAU), wob: rr(0, TAU),
+  };
+  if (kind === 'boss') { bossRef = e; e.hp = e.hpMax = 900 + wave * 160; }
+  enemies.push(e);
+}
+
+/* ---------- combat helpers ---------- */
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rr(0, TAU), s = rr(speed * 0.25, speed);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rr(0.25, 0.7), t: 0, color, size: rr(1.5, 3.5) });
+  }
+}
+function floatText(x, y, text, color) { texts.push({ x, y, text, color, t: 0 }); }
+function damageEnemy(e, dmg) {
+  e.hp -= dmg; e.hitT = 0.09;
+  if (e.hp <= 0 && !e.dead) {
+    e.dead = true; kills++; score += e.scoreV;
+    burst(e.x, e.y, e.color, e.kind === 'boss' ? 70 : e.kind === 'tank' ? 30 : 14, 260);
+    shake = Math.min(14, shake + (e.kind === 'boss' ? 12 : e.kind === 'tank' ? 5 : 2));
+    sfx.boom();
+    for (let i = 0; i < e.xp; i++) shards.push({ x: e.x + rr(-10, 10), y: e.y + rr(-10, 10), vx: rr(-40, 40), vy: rr(-40, 40), t: 0 });
+    if (e.kind === 'tank') for (let i = 0; i < 2; i++) { const c = { ...e, kind: 'chaser', hp: 20, hpMax: 20, r: 13, x: e.x + rr(-16, 16), y: e.y + rr(-16, 16), dead: false, color: '#ff5470', xp: 1, scoreV: 50 }; enemies.push(c); }
+    if (e.kind === 'boss') { bossRef = null; floatText(core.x, core.y - 70, 'WARDEN DOWN  +' + e.scoreV, '#7CFC9A'); }
+  }
+}
+function hurtPlayer(dmg) {
+  if (player.shieldT > 0) return;
+  player.hp -= dmg; player.shieldT = 0.55; shake = Math.min(16, shake + 6); sfx.hurt();
+  burst(player.x, player.y, '#40e0ff', 12, 220);
+  if (player.hp <= 0) gameOver('Your fighter was torn apart.');
+}
+function hurtCore(dmg) {
+  core.hp -= dmg; shake = Math.min(16, shake + 5); sfx.hurt();
+  burst(core.x, core.y, '#ffd166', 10, 200);
+  if (core.hp <= 0) gameOver('The Bastion core went dark.');
+}
+let overReason = '';
+function gameOver(reason) { overReason = reason; state = 'over'; overTimer = 0; burst(core.x, core.y, '#ffd166', 60, 340); }
+
+/* ---------- upgrades ---------- */
+const UPGRADES = [
+  { name: 'Heavy Bolts', desc: '+35% bullet damage', apply: () => { player.damage *= 1.35; } },
+  { name: 'Rapid Cycler', desc: '+22% fire rate', apply: () => { player.fireRate *= 1.22; } },
+  { name: 'Split Cannon', desc: '+1 projectile per shot', apply: () => { player.shots += 1; } },
+  { name: 'Ion Lance', desc: 'Shots pierce +1 enemy', apply: () => { player.pierce += 1; } },
+  { name: 'Aegis Plating', desc: '+30 max hull, heal 30', apply: () => { player.hpMax += 30; player.hp = Math.min(player.hpMax, player.hp + 30); } },
+  { name: 'Core Suture', desc: 'Repair the Bastion by 60', apply: () => { core.hp = Math.min(core.hpMax, core.hp + 60); } },
+  { name: 'Flux Magnet', desc: '+70% pickup radius', apply: () => { player.magnet *= 1.7; } },
+  { name: 'Nova Charge', desc: 'Level-ups release a nova blast', apply: () => { player.nova += 1; } },
+  { name: 'Thrusters', desc: '+12% move speed', apply: () => { player.speed *= 1.12; } },
+  { name: 'Nanobots', desc: 'Regenerate 1.2 hull / second', apply: () => { player.regen += 1.2; } },
+];
+let cards = [];
+function offerCards() {
+  const pool = [...UPGRADES];
+  cards = [];
+  for (let i = 0; i < 3; i++) cards.push(pool.splice(Math.floor(rand() * pool.length), 1)[0]);
+}
+function cardRect(i) { return { x: W / 2 - 330 + i * 230, y: H / 2 - 90, w: 200, h: 180 }; }
+function pickCard(x, y) {
+  for (let i = 0; i < 3; i++) {
+    const r = cardRect(i);
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+      cards[i].apply(); sfx.level();
+      if (player.nova > 0) {
+        for (const e of [...enemies]) if (Math.hypot(e.x - player.x, e.y - player.y) < 190) damageEnemy(e, 60 * player.nova);
+        burst(player.x, player.y, '#40e0ff', 40, 320);
+      }
+      state = 'play';
+      return;
+    }
+  }
+}
+function gainFlux(n) {
+  flux += n; score += 10 * n;
+  if (flux >= xpNext) {
+    flux -= xpNext; level++; xpNext = Math.floor(xpNext * 1.45) + 2;
+    offerCards(); state = 'levelup'; sfx.level();
+  }
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  time += dt;
+  if (bannerT > 0) bannerT -= dt;
+  for (const s of stars) { s.y += s.z * 9 * dt; if (s.y > H) { s.y = -2; s.x = rr(0, W); } }
+  parts = parts.filter((p) => (p.t += dt) < p.life);
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.92; p.vy *= 0.92; }
+  texts = texts.filter((t) => (t.t += dt) < 1.1);
+  if (state === 'over') { overTimer += dt; return; }
+  if (state !== 'play') return;
+
+  /* player movement */
+  let mx = 0, my = 0;
+  if (keys['w'] || keys['arrowup']) my -= 1;
+  if (keys['s'] || keys['arrowdown']) my += 1;
+  if (keys['a'] || keys['arrowleft']) mx -= 1;
+  if (keys['d'] || keys['arrowright']) mx += 1;
+  const ml = Math.hypot(mx, my) || 1;
+  player.x = Math.max(20, Math.min(W - 20, player.x + (mx / ml) * player.speed * dt));
+  player.y = Math.max(20, Math.min(H - 20, player.y + (my / ml) * player.speed * dt));
+  player.angle = Math.atan2(mouseY - player.y, mouseX - player.x);
+  if (player.shieldT > 0) player.shieldT -= dt;
+  if (player.regen > 0) player.hp = Math.min(player.hpMax, player.hp + player.regen * dt);
+  core.pulse += dt;
+
+  /* firing */
+  player.cooldown -= dt;
+  if ((mouseDown || keys[' ']) && player.cooldown <= 0) {
+    player.cooldown = 1 / player.fireRate;
+    const spread = 0.09;
+    for (let i = 0; i < player.shots; i++) {
+      const off = (i - (player.shots - 1) / 2) * spread;
+      const a = player.angle + off + rr(-0.012, 0.012);
+      bullets.push({ x: player.x + Math.cos(player.angle) * 16, y: player.y + Math.sin(player.angle) * 16, vx: Math.cos(a) * player.bulletSpeed, vy: Math.sin(a) * player.bulletSpeed, dmg: player.damage, pierce: player.pierce });
+    }
+    sfx.shoot();
+  }
+
+  /* spawning + wave flow */
+  if (spawnQueue.length > 0) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnEnemy(spawnQueue.pop()); spawnTimer = Math.max(0.24, 0.9 - wave * 0.045); }
+  } else if (enemies.length === 0 && waveState !== 'announce') {
+    score += 250 + wave * 50; nextWave();
+  }
+  if (waveState === 'announce' && bannerT <= 0) waveState = 'fight';
+
+  /* enemies */
+  for (const e of enemies) {
+    e.wob += dt * 2;
+    if (e.hitT > 0) e.hitT -= dt;
+    const toCore = Math.atan2(core.y - e.y, core.x - e.x);
+    const toPlayer = Math.atan2(player.y - e.y, player.x - e.x);
+    const dCore = Math.hypot(core.x - e.x, core.y - e.y);
+    const dPlayer = Math.hypot(player.x - e.x, player.y - e.y);
+    let ang = toCore;
+    if (e.kind === 'dart' && dPlayer < 300) ang = toPlayer;
+    if (e.kind === 'boss') {
+      ang = toCore;
+      e.fireT -= dt;
+      if (e.fireT <= 0 && dCore < 560) {
+        e.fireT = 1.5;
+        for (let i = 0; i < 10; i++) {
+          const a = (i / 10) * TAU + e.spin;
+          ebullets.push({ x: e.x, y: e.y, vx: Math.cos(a) * 165, vy: Math.sin(a) * 165, r: 5, dmg: 12 });
+        }
+        sfx.shoot();
+      }
+    }
+    const wob = Math.sin(e.wob) * (e.kind === 'dart' ? 0.7 : 0.25);
+    e.x += Math.cos(ang + wob) * e.speed * dt;
+    e.y += Math.sin(ang + wob) * e.speed * dt;
+    e.spin += dt * 0.8;
+    if (dCore < core.r + e.r - 4) { hurtCore(e.dmg); e.dead = true; burst(e.x, e.y, e.color, 12, 200); }
+    else if (dPlayer < player.r + e.r - 2) { hurtPlayer(e.dmg); e.dead = true; burst(e.x, e.y, e.color, 12, 200); }
+  }
+  enemies = enemies.filter((e) => !e.dead);
+
+  /* bullets */
+  for (const b of bullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { b.dead = true; continue; }
+    for (const e of enemies) {
+      if (e.dead) continue;
+      if (Math.hypot(e.x - b.x, e.y - b.y) < e.r + 3) {
+        damageEnemy(e, b.dmg);
+        if (b.pierce > 0) b.pierce--; else { b.dead = true; break; }
+      }
+    }
+  }
+  bullets = bullets.filter((b) => !b.dead);
+  enemies = enemies.filter((e) => !e.dead);
+  for (const b of ebullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { b.dead = true; continue; }
+    if (Math.hypot(player.x - b.x, player.y - b.y) < player.r + b.r) { hurtPlayer(b.dmg); b.dead = true; }
+    if (Math.hypot(core.x - b.x, core.y - b.y) < core.r + b.r) { hurtCore(b.dmg * 0.6); b.dead = true; }
+  }
+  ebullets = ebullets.filter((b) => !b.dead);
+
+  /* flux shards */
+  for (const s of shards) {
+    s.t += dt;
+    const d = Math.hypot(player.x - s.x, player.y - s.y);
+    if (d < player.magnet) { const a = Math.atan2(player.y - s.y, player.x - s.x); s.vx += Math.cos(a) * 900 * dt; s.vy += Math.sin(a) * 900 * dt; }
+    s.x += s.vx * dt; s.y += s.vy * dt; s.vx *= 0.94; s.vy *= 0.94;
+    if (d < player.r + 8) { s.dead = true; gainFlux(1); sfx.pickup(); if (state !== 'play') break; }
+  }
+  shards = shards.filter((s) => !s.dead && s.t < 25);
+  if (shake > 0) shake = Math.max(0, shake - dt * 26);
+}
+
+/* ---------- drawing ---------- */
+function drawShip(x, y, angle, color, scale) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle); ctx.scale(scale, scale);
+  ctx.beginPath();
+  ctx.moveTo(16, 0); ctx.lineTo(-11, -10); ctx.lineTo(-6, 0); ctx.lineTo(-11, 10); ctx.closePath();
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 1.4; ctx.stroke();
+  ctx.beginPath(); ctx.arc(2, 0, 4.2, 0, TAU); ctx.fillStyle = '#eafcff'; ctx.fill();
+  ctx.restore();
+}
+function drawEnemy(e) {
+  ctx.save(); ctx.translate(e.x, e.y);
+  const flash = e.hitT > 0;
+  ctx.fillStyle = flash ? '#ffffff' : e.color;
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1.2;
+  if (e.kind === 'chaser') {
+    ctx.rotate(e.spin);
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) { const a = (i / 3) * TAU; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * e.r, Math.sin(a) * e.r); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else if (e.kind === 'dart') {
+    ctx.rotate(Math.atan2(core.y - e.y, core.x - e.x));
+    ctx.beginPath(); ctx.moveTo(e.r + 3, 0); ctx.lineTo(-e.r, -e.r * 0.75); ctx.lineTo(-e.r * 0.4, 0); ctx.lineTo(-e.r, e.r * 0.75); ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else if (e.kind === 'tank') {
+    ctx.rotate(e.spin * 0.5);
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) { const a = (i / 6) * TAU; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * e.r, Math.sin(a) * e.r); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, e.r * 0.45, 0, TAU); ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fill();
+  } else if (e.kind === 'boss') {
+    ctx.rotate(e.spin * 0.4);
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) { const a = (i / 8) * TAU; const rad = i % 2 ? e.r * 0.78 : e.r; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * rad, Math.sin(a) * rad); }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, e.r * 0.34, 0, TAU); ctx.fillStyle = '#fff0f3'; ctx.fill();
+  }
+  ctx.restore();
+  if (e.hp < e.hpMax && e.kind !== 'chaser') {
+    ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(e.x - e.r, e.y - e.r - 10, e.r * 2, 4);
+    ctx.fillStyle = '#7CFC9A'; ctx.fillRect(e.x - e.r, e.y - e.r - 10, e.r * 2 * Math.max(0, e.hp / e.hpMax), 4);
+  }
+}
+function bar(x, y, w, h, frac, color, label) {
+  ctx.fillStyle = 'rgba(255,255,255,.14)'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = color; ctx.fillRect(x, y, w * Math.max(0, Math.min(1, frac)), h);
+  ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.font = '11px "Segoe UI", sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText(label, x + 5, y + h - 2.5);
+}
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rr(-shake, shake) * 0.5, rr(-shake, shake) * 0.5);
+  const g = ctx.createRadialGradient(W / 2, H / 2, 80, W / 2, H / 2, 760);
+  g.addColorStop(0, '#0d1230'); g.addColorStop(0.55, '#070a20'); g.addColorStop(1, '#04050d');
+  ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+  const neb = ctx.createRadialGradient(W * 0.78, H * 0.2, 10, W * 0.78, H * 0.2, 340);
+  neb.addColorStop(0, 'rgba(120,60,220,.16)'); neb.addColorStop(1, 'rgba(120,60,220,0)');
+  ctx.fillStyle = neb; ctx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    ctx.globalAlpha = 0.35 + 0.4 * Math.abs(Math.sin(time * 0.7 + s.tw));
+    ctx.fillStyle = '#cfe9ff';
+    ctx.fillRect(s.x, s.y, s.z * 2.1, s.z * 2.1);
+  }
+  ctx.globalAlpha = 1;
+
+  /* the Bastion core (kept off the title screen, where it would sit behind the words) */
+  if (state !== 'title') {
+  const pulse = 1 + Math.sin(core.pulse * 2.4) * 0.05;
+  ctx.save(); ctx.translate(core.x, core.y);
+  ctx.beginPath(); ctx.arc(0, 0, core.r * 1.9 * pulse, 0, TAU);
+  ctx.strokeStyle = 'rgba(64,224,255,.20)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, core.r * 1.45 * pulse, 0, TAU);
+  ctx.strokeStyle = 'rgba(64,224,255,.35)'; ctx.stroke();
+  for (let i = 0; i < 3; i++) {
+    const a = core.pulse * (0.25 + i * 0.11) + (i * TAU) / 3;
+    ctx.beginPath();
+    ctx.arc(Math.cos(a) * core.r * 1.45, Math.sin(a) * core.r * 1.45, 3.4, 0, TAU);
+    ctx.fillStyle = '#8be9ff'; ctx.fill();
+  }
+  const cg = ctx.createRadialGradient(0, 0, 2, 0, 0, core.r);
+  cg.addColorStop(0, '#ffffff'); cg.addColorStop(0.45, '#ffd166'); cg.addColorStop(1, '#ff9f1c');
+  ctx.beginPath(); ctx.arc(0, 0, core.r * 0.72, 0, TAU); ctx.fillStyle = cg; ctx.fill();
+  ctx.restore();
+  }
+
+  for (const s of shards) {
+    ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(time * 3 + s.t);
+    ctx.fillStyle = '#3dffc8';
+    ctx.fillRect(-3.4, -3.4, 6.8, 6.8);
+    ctx.restore();
+  }
+  for (const e of enemies) drawEnemy(e);
+  for (const b of bullets) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, 3.1, 0, TAU);
+    ctx.fillStyle = '#aef4ff'; ctx.fill();
+    ctx.beginPath(); ctx.arc(b.x, b.y, 6, 0, TAU);
+    ctx.fillStyle = 'rgba(64,224,255,.22)'; ctx.fill();
+  }
+  for (const b of ebullets) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU);
+    ctx.fillStyle = '#ff7b9c'; ctx.fill();
+  }
+  for (const p of parts) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  if (state !== 'title') {
+    drawShip(player.x, player.y, player.angle, player.shieldT > 0.25 ? '#bffbff' : '#40e0ff', 1);
+    if (player.shieldT > 0) {
+      ctx.beginPath(); ctx.arc(player.x, player.y, player.r + 7, 0, TAU);
+      ctx.strokeStyle = 'rgba(140,240,255,.5)'; ctx.lineWidth = 1.6; ctx.stroke();
+    }
+  }
+  for (const t of texts) {
+    ctx.globalAlpha = 1 - t.t / 1.1;
+    ctx.fillStyle = t.color; ctx.font = 'bold 17px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(t.text, t.x, t.y - t.t * 34);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  /* ---------- HUD ---------- */
+  if (state === 'play' || state === 'levelup' || state === 'pause') {
+    bar(18, 16, 230, 15, player.hp / player.hpMax, '#40e0ff', 'HULL ' + Math.ceil(player.hp) + ' / ' + player.hpMax);
+    bar(18, 38, 230, 15, core.hp / core.hpMax, '#ffd166', 'BASTION ' + Math.ceil(core.hp) + ' / ' + core.hpMax);
+    bar(18, 60, 230, 11, flux / xpNext, '#3dffc8', 'FLUX — LEVEL ' + level);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 21px "Segoe UI", sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText('SCORE ' + score.toLocaleString('en-US'), W - 20, 34);
+    ctx.font = '15px "Segoe UI", sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.75)';
+    ctx.fillText('WAVE ' + wave + '   ·   KILLS ' + kills + (bossRef ? '   ·   WARDEN ' + Math.max(0, Math.ceil(bossRef.hp)) + ' HP' : ''), W - 20, 58);
+    ctx.textAlign = 'left'; ctx.font = '12.5px "Segoe UI", sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.45)';
+    ctx.fillText('WASD move · mouse aim · click / space fire · P pause · M mute', 18, H - 14);
+    if (bannerT > 0) {
+      ctx.globalAlpha = Math.min(1, bannerT);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 44px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(banner, W / 2, 120);
+      ctx.globalAlpha = 1;
+    }
+  }
+  if (state === 'levelup') {
+    ctx.fillStyle = 'rgba(3,4,12,.72)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 34px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('LEVEL ' + level + ' — CHOOSE AN UPGRADE', W / 2, H / 2 - 140);
+    for (let i = 0; i < 3; i++) {
+      const r = cardRect(i);
+      const hover = mouseX >= r.x && mouseX <= r.x + r.w && mouseY >= r.y && mouseY <= r.y + r.h;
+      ctx.fillStyle = hover ? 'rgba(64,224,255,.20)' : 'rgba(255,255,255,.07)';
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = hover ? '#40e0ff' : 'rgba(255,255,255,.35)'; ctx.lineWidth = 2;
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+      ctx.fillStyle = '#8be9ff'; ctx.font = 'bold 19px "Segoe UI", sans-serif';
+      ctx.fillText(cards[i].name, r.x + r.w / 2, r.y + 52);
+      ctx.fillStyle = 'rgba(255,255,255,.88)'; ctx.font = '15.5px "Segoe UI", sans-serif';
+      ctx.fillText(cards[i].desc, r.x + r.w / 2, r.y + 92);
+      ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.font = '13px "Segoe UI", sans-serif';
+      ctx.fillText('click to install', r.x + r.w / 2, r.y + 140);
+    }
+  }
+  if (state === 'pause') {
+    ctx.fillStyle = 'rgba(3,4,12,.6)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 40px "Segoe UI", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('PAUSED', W / 2, H / 2);
+    ctx.font = '17px "Segoe UI", sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.75)';
+    ctx.fillText('Press P to resume', W / 2, H / 2 + 38);
+  }
+  if (state === 'title') {
+    ctx.fillStyle = 'rgba(3,4,12,.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#8be9ff'; ctx.font = 'bold 92px "Segoe UI", sans-serif';
+    ctx.fillText('A E G I S', W / 2, 218);
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 27px "Segoe UI", sans-serif';
+    ctx.fillText('N E O N   B A S T I O N', W / 2, 262);
+    ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.font = '19px "Segoe UI", sans-serif';
+    ctx.fillText('The swarm is coming for the last Bastion core. You are its shield.', W / 2, 330);
+    ctx.fillText('Shoot the wrecks down, harvest their flux, grow stronger every level —', W / 2, 360);
+    ctx.fillText('and do not let anything reach the core.', W / 2, 390);
+    ctx.fillStyle = '#3dffc8'; ctx.font = '16.5px "Segoe UI", sans-serif';
+    ctx.fillText('WASD / arrows — move        Mouse — aim        Click / Space — fire', W / 2, 448);
+    ctx.fillText('Survive escalating waves. Every 5th wave, a Warden comes to finish the job.', W / 2, 478);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 23px "Segoe UI", sans-serif';
+    ctx.fillText(Math.sin(time * 2.4) > -0.25 ? 'CLICK OR PRESS ENTER TO DEFEND' : '', W / 2, 556);
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(3,4,12,.68)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff5470'; ctx.font = 'bold 58px "Segoe UI", sans-serif';
+    ctx.fillText('THE BASTION FALLS', W / 2, 240);
+    ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.font = '19px "Segoe UI", sans-serif';
+    ctx.fillText(overReason, W / 2, 292);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 30px "Segoe UI", sans-serif';
+    ctx.fillText('SCORE ' + score.toLocaleString('en-US'), W / 2, 356);
+    ctx.font = '18px "Segoe UI", sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.8)';
+    ctx.fillText('Waves survived: ' + wave + '    ·    Kills: ' + kills + '    ·    Level reached: ' + level, W / 2, 394);
+    ctx.fillStyle = '#3dffc8'; ctx.font = 'bold 20px "Segoe UI", sans-serif';
+    ctx.fillText(overTimer > 0.6 ? 'CLICK OR PRESS ENTER TO DEFEND AGAIN' : '', W / 2, 470);
+  }
+}
+
+/* ---------- screenshot scenes (deterministic, for the dossier) ---------- */
+function buildShotScene() {
+  reset();
+  rand = mulberry32(seedBase * 7919 + 99);
+  if (shotMode === 'start') { state = 'title'; return; }
+  state = 'play';
+  wave = 6; bannerT = 0; waveState = 'fight'; spawnQueue = [];
+  player.x = W / 2 - 210; player.y = H / 2 + 120; player.angle = -0.5;
+  player.hp = 78; core.hp = 176; score = 12450; kills = 87; level = 5; flux = 4; xpNext = 16;
+  const kinds = ['chaser', 'chaser', 'dart', 'chaser', 'tank', 'dart', 'chaser', 'chaser'];
+  for (let i = 0; i < kinds.length; i++) {
+    spawnEnemy(kinds[i]);
+    const e = enemies[enemies.length - 1];
+    e.x = rr(120, W - 120); e.y = rr(80, H - 120);
+    if (Math.hypot(e.x - core.x, e.y - core.y) < 130) { e.x += 200; }
+    e.hp = e.hpMax * rr(0.4, 1);
+  }
+  for (let i = 0; i < 9; i++) bullets.push({ x: player.x + i * 26 + 20, y: player.y - i * 13, vx: 0, vy: 0, dmg: 1, pierce: 0 });
+  for (let i = 0; i < 12; i++) shards.push({ x: rr(200, W - 200), y: rr(120, H - 120), vx: 0, vy: 0, t: 0 });
+  burst(W * 0.68, H * 0.34, '#ff5470', 16, 240);
+  burst(W * 0.3, H * 0.6, '#c65dff', 12, 200);
+  if (shotMode === 'end') {
+    state = 'over'; overTimer = 2; overReason = 'The Bastion core went dark.';
+    wave = 9; score = 21830; kills = 143; level = 7; core.hp = 0;
+  }
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+if (shotMode) buildShotScene(); else reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
